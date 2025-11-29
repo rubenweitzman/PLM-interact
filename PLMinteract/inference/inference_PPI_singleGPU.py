@@ -115,11 +115,23 @@ class CrossEncoder():
         test_samples = load_test_objs(args.test_filepath)
         test_dataloader = DataLoader(test_samples, batch_size=batch_size_val,collate_fn = self.smart_batching_collate,shuffle=False)
         pred_scores = []
-        for _, (features) in enumerate (test_dataloader):
+        total_batches = len(test_dataloader)
+        total_samples = len(test_samples)
+        logger.info(f"Running inference on {total_samples} samples in {total_batches} batches (batch_size={batch_size_val})")
+        
+        for batch_idx, features in enumerate(tqdm(test_dataloader, desc="PLM-interact inference", unit="batch")):
                 with torch.no_grad():
                     probability = self.model.forward_test(features)
                 pred_scores.extend(probability)
+                
+                # Log progress every 10% of batches
+                if (batch_idx + 1) % max(1, total_batches // 10) == 0:
+                    progress_pct = ((batch_idx + 1) / total_batches) * 100
+                    samples_done = min((batch_idx + 1) * batch_size_val, total_samples)
+                    logger.info(f"Progress: {progress_pct:.1f}% ({samples_done}/{total_samples} samples)")
+        
         pred_scores = np.asarray([score.cpu().detach().numpy() for score in pred_scores])
+        logger.info(f"Inference complete. Processed {len(pred_scores)} predictions.")
         pd.DataFrame(pred_scores).to_csv(output_path + 'pred_scores.csv', index=None,header=None)
 
 def main(args,argsDict):

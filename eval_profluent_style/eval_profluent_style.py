@@ -49,8 +49,7 @@ except ImportError:
 
 # Import PLM-interact modules
 try:
-    from PLMinteract.inference.inference_PPI_singleGPU import CrossEncoder, InferenceArguments
-    from PLMinteract.utils.data_load import load_test_objs
+    from PLMinteract.inference.inference_PPI_singleGPU import CrossEncoder
 except ImportError as e:
     logging.error(f"Failed to import PLM-interact modules: {e}")
     logging.error("Make sure PLM-interact is installed: pip install -e .")
