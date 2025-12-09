@@ -30,7 +30,7 @@ import torch
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 import tempfile
 from tqdm import tqdm
 
@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 
 
 # Dataset paths from dataset_to_eval.md
-DATASET_PATHS = {
+# Dataset paths - supports both MDS and CSV formats
+DATASET_PATHS_MDS = {
     "alignment_skempi": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/alignment_skempi",
     "alignment_mutational_ppi": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/alignment_mutational_ppi",
     "alignment_yeast_ppi_combined": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/alignment_yeast_ppi_combined",
@@ -74,6 +75,44 @@ DATASET_PATHS = {
     "alignment_gold_combined": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/alignment_gold_combined",
     "human_validation_with_negatives": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/human_validation_with_negatives",
 }
+
+# CSV paths (direct CSV format)
+DATASET_PATHS_CSV = {
+    "alignment_intact_covid": "gs://profluent-rweitzman/alignment/test_dataset_csv_round_2/alignment_intact_covid.csv",
+    "alignment_virus_human": "gs://profluent-rweitzman/alignment/test_dataset_csv_round_2/alignment_virus_human.csv",
+}
+
+# Combined lookup
+DATASET_PATHS = {**DATASET_PATHS_MDS, **DATASET_PATHS_CSV}
+
+
+def load_csv_dataset(csv_path: str, max_samples: Optional[int] = None) -> Tuple[pd.DataFrame, List[Dict]]:
+    """Load CSV dataset from GCS or local path."""
+    logger.info(f"Loading CSV dataset from: {csv_path}")
+    
+    if csv_path.startswith("gs://"):
+        local_csv = tempfile.NamedTemporaryFile(suffix=".csv", delete=False).name
+        logger.info(f"Downloading to: {local_csv}")
+        cmd = f"gcloud storage cp {shlex.quote(csv_path)} {shlex.quote(local_csv)}"
+        subprocess.run(shlex.split(cmd), check=True)
+        csv_path = local_csv
+    
+    df = pd.read_csv(csv_path)
+    logger.info(f"CSV contains {len(df)} rows, columns: {list(df.columns)}")
+    
+    if max_samples and max_samples < len(df):
+        df = df.head(max_samples)
+        logger.info(f"Limited to {max_samples} samples")
+    
+    samples = []
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Loading samples"):
+        samples.append({
+            'sequence': row.get('sequence', ''),
+            'value': float(row.get('value', 0.0)),
+            'data_source': row.get('data_source', 'default')
+        })
+    
+    return df, samples
 
 
 def load_mds_dataset(gcs_path: str, max_samples: Optional[int] = None, local_cache_dir: Optional[str] = None) -> List[Dict]:
@@ -249,13 +288,17 @@ def run_ppi_prediction(
     
     logger.info(f"Loading PLM-interact model from checkpoint: {checkpoint_path}")
     
-    # Ensure offline_model_path ends with / for concatenation
-    if not offline_model_path.endswith('/'):
-        offline_model_path = offline_model_path + '/'
-    
-    # Create model path (offline_model_path + model_name)
-    # CrossEncoder expects offline_model_path to be concatenated with model_name
-    model_path = offline_model_path + model_name
+    # Create model path
+    # If offline_model_path is empty or not provided, use model_name directly (HuggingFace)
+    if offline_model_path and offline_model_path.strip():
+        # Ensure offline_model_path ends with / for concatenation
+        if not offline_model_path.endswith('/'):
+            offline_model_path = offline_model_path + '/'
+        model_path = offline_model_path + model_name
+    else:
+        # Use HuggingFace model name directly
+        model_path = model_name
+        offline_model_path = ""  # Ensure it's empty string
     
     # Initialize CrossEncoder
     trainer = CrossEncoder(
@@ -315,6 +358,11 @@ def run_ppi_prediction(
     "--gcs-path",
     type=str,
     help="GCS path to MDS dataset (overrides dataset-name if provided)"
+)
+@click.option(
+    "--csv-path",
+    type=str,
+    help="GCS or local path to CSV file (format: sequence,value,data_source). Overrides --gcs-path"
 )
 @click.option(
     "--checkpoint-path",
@@ -386,6 +434,7 @@ def run_ppi_prediction(
 def main(
     dataset_name: Optional[str],
     gcs_path: Optional[str],
+    csv_path: Optional[str],
     checkpoint_path: str,
     offline_model_path: str,
     model_name: str,
@@ -397,22 +446,31 @@ def main(
     batch_size: int,
     seed: int,
 ) -> None:
-    """Run PLM-interact PPI prediction evaluation on MDS dataset."""
+    """Run PLM-interact PPI prediction evaluation on MDS or CSV dataset."""
     
-    # Determine GCS path
-    if gcs_path:
-        dataset_gcs_path = gcs_path
+    # Determine data source (CSV takes priority)
+    use_csv = False
+    original_df = None
+    
+    if csv_path:
+        data_path = csv_path
+        use_csv = True
+    elif gcs_path:
+        data_path = gcs_path
+        use_csv = gcs_path.endswith('.csv')
     elif dataset_name and dataset_name in DATASET_PATHS:
-        dataset_gcs_path = DATASET_PATHS[dataset_name]
+        data_path = DATASET_PATHS[dataset_name]
+        use_csv = dataset_name in DATASET_PATHS_CSV or data_path.endswith('.csv')
     else:
-        logger.error(f"Must provide either --gcs-path or --dataset-name (one of: {list(DATASET_PATHS.keys())})")
+        logger.error(f"Must provide --csv-path, --gcs-path, or --dataset-name (one of: {list(DATASET_PATHS.keys())})")
         sys.exit(1)
     
     logger.info("="*80)
     logger.info("PLM-interact PPI Prediction Evaluation")
     logger.info("="*80)
     logger.info(f"Dataset: {dataset_name or 'custom'}")
-    logger.info(f"GCS Path: {dataset_gcs_path}")
+    logger.info(f"Data Path: {data_path}")
+    logger.info(f"Format: {'CSV' if use_csv else 'MDS'}")
     logger.info(f"Checkpoint: {checkpoint_path}")
     logger.info(f"Model: {model_name}")
     logger.info(f"Embedding Size: {embedding_size}")
@@ -423,9 +481,13 @@ def main(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Step 1: Load MDS dataset
-    logger.info("\n[Step 1/4] Loading MDS dataset...")
-    samples = load_mds_dataset(dataset_gcs_path, max_samples=max_samples)
+    # Step 1: Load dataset (CSV or MDS)
+    if use_csv:
+        logger.info("\n[Step 1/4] Loading CSV dataset...")
+        original_df, samples = load_csv_dataset(data_path, max_samples=max_samples)
+    else:
+        logger.info("\n[Step 1/4] Loading MDS dataset...")
+        samples = load_mds_dataset(data_path, max_samples=max_samples)
     
     # Step 2: Extract protein pairs
     logger.info("\n[Step 2/4] Extracting protein pairs...")
@@ -460,28 +522,37 @@ def main(
     
     predictions = results['predictions']
     
-    # Build output rows preserving original structure
-    output_rows = []
-    for i, sample in enumerate(tqdm(samples, desc="Creating output", unit="samples")):
-        # Prediction score (always present)
-        if i < len(predictions):
-            prediction_score = float(predictions[i])
+    # If we loaded from CSV, add column to original DataFrame
+    if use_csv and original_df is not None:
+        logger.info("Adding prediction column to original CSV...")
+        output_df = original_df.copy()
+        
+        if len(predictions) == len(output_df):
+            output_df['plm_interact_prediction'] = predictions
         else:
-            logger.warning(f"Could not find prediction for sample {i}")
-            prediction_score = np.nan
+            logger.warning(f"Prediction count mismatch: {len(predictions)} vs {len(output_df)} rows")
+            output_df['plm_interact_prediction'] = np.nan
+            output_df.loc[:len(predictions)-1, 'plm_interact_prediction'] = predictions
+    else:
+        # Build output rows from samples (MDS format)
+        output_rows = []
+        for i, sample in enumerate(tqdm(samples, desc="Creating output", unit="samples")):
+            if i < len(predictions):
+                prediction_score = float(predictions[i])
+            else:
+                logger.warning(f"Could not find prediction for sample {i}")
+                prediction_score = np.nan
+            
+            row = {
+                'data_source': sample.get('data_source', ''),
+                'sequence': sample['sequence'],
+                'value': sample['value'],
+                'plm_interact_prediction': prediction_score,
+            }
+            output_rows.append(row)
         
-        # Preserve original structure and add prediction
-        row = {
-            'data_source': sample.get('data_source', ''),
-            'sequence': sample['sequence'],
-            'value': sample['value'],
-            'prediction': prediction_score,
-        }
-        
-        output_rows.append(row)
+        output_df = pd.DataFrame(output_rows)
     
-    # Create DataFrame and save to CSV
-    output_df = pd.DataFrame(output_rows)
     csv_output_file = output_path / "results.csv"
     output_df.to_csv(csv_output_file, index=False)
     logger.info(f"Saved CSV results to {csv_output_file}")
@@ -493,7 +564,7 @@ def main(
     
     # Add metadata to results
     results['dataset_name'] = dataset_name or 'custom'
-    results['dataset_gcs_path'] = dataset_gcs_path
+    results['data_path'] = data_path
     results['num_samples'] = len(samples)
     results['num_pairs'] = len(pairs)
     
@@ -508,10 +579,10 @@ def main(
     logger.info(f"Total pairs: {len(pairs)}")
     
     # Log predictions
-    if 'prediction' in output_df.columns and not output_df['prediction'].isna().all():
-        valid_preds = output_df['prediction'].dropna()
-        logger.info(f"Prediction range: {valid_preds.min():.4f} - {valid_preds.max():.4f}")
-        logger.info(f"Prediction mean: {valid_preds.mean():.4f}")
+    if 'plm_interact_prediction' in output_df.columns and not output_df['plm_interact_prediction'].isna().all():
+        valid_preds = output_df['plm_interact_prediction'].dropna()
+        logger.info(f"PLM-interact prediction range: {valid_preds.min():.4f} - {valid_preds.max():.4f}")
+        logger.info(f"PLM-interact prediction mean: {valid_preds.mean():.4f}")
     
     logger.info(f"CSV results saved to: {csv_output_file}")
     logger.info(f"Detailed results saved to: {results_file}")
